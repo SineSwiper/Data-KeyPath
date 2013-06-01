@@ -22,27 +22,42 @@ no warnings 'uninitialized';
 
 my $default_behavior = 'LEFT_PRECEDENT_STRICT_ARRAY_INDEX';
 
-Hash::Merge->specify_behavior(
+Hash::Merge::specify_behavior(
    {
+      # NOTE: Undef is still considered 'SCALAR'.  Furthermore, Hash::Merge seems to convert it to ''.
       SCALAR => {
          SCALAR => sub { $_[1] },
-         ARRAY  => sub { die sprintf('Mismatched type (%s vs. %s) found during merge: $scalar = %s', 'SCALAR', 'ARRAY', $_[0]); },
-         HASH   => sub { die sprintf('Mismatched type (%s vs. %s) found during merge: $scalar = %s', 'SCALAR', 'HASH',  $_[0]); },
+         ARRAY  => sub {
+            return $_[1] unless $_[0];
+            die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'SCALAR', 'ARRAY', $_[0]);
+         },
+         HASH   => sub {
+            return $_[1] unless $_[0];
+            die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'SCALAR', 'HASH',  $_[0]);
+         },
       },
       ARRAY => {
-         SCALAR => sub { die sprintf('Mismatched type (%s vs. %s) found during merge: $scalar = %s', 'ARRAY', 'SCALAR', $_[1]); },
+         SCALAR => sub {
+            return $_[0] unless $_[1];
+            die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'ARRAY', 'SCALAR', $_[1]);
+         },
          ARRAY  => sub {
+            # Handle arrays by index, not by combining
             my ($l, $r) = @_;
             $l->[$_] = $r->[$_] for (
                grep { defined $r->[$_] }
                (0 .. $#{$_[1]})
             );
+            return $l;
          },
-         HASH   => sub { die sprintf('Mismatched type (%s vs. %s) found during merge', 'ARRAY', 'HASH'); },
+         HASH   => sub { die sprintf('mismatched type (%s vs. %s) found during merge', 'ARRAY', 'HASH'); },
       },
       HASH => {
-         SCALAR => sub { die sprintf('Mismatched type (%s vs. %s) found during merge: $scalar = %s',  'HASH', 'SCALAR', $_[1]); },
-         ARRAY  => sub { die sprintf('Mismatched type (%s vs. %s) found during merge', 'HASH', 'ARRAY'); },
+         SCALAR => sub {
+            return $_[0] unless $_[1];
+            die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'HASH', 'SCALAR', $_[1]);
+         },
+         ARRAY  => sub { die sprintf('mismatched type (%s vs. %s) found during merge', 'HASH', 'ARRAY'); },
          HASH   => sub { Hash::Merge::_merge_hashes( $_[0], $_[1] ) }, 
       },
    }, 
@@ -54,14 +69,14 @@ Hash::Merge->specify_behavior(
 
 my $rule_coercion = sub {
    my $rule = $_[0];
-   return sub { $_[0] =~ $rule ? $1 : undef; } if (ref $_[0] eq 'Regexp');
+   return sub { ($_[0] =~ $rule) ? $1 : undef; } if (ref $_[0] eq 'Regexp');
    $rule;
 };
 
 has key_split_expand_rule => (
    is      => 'ro',
    isa     => AnyOf[RegexpRef, CodeRef],
-   default => sub { qr/\.|(?<=\])\.?(?=\[)/ },
+   default => sub { qr/\.|(?<=\]|\w)\.?(?=\[)/ },
    coerce  => sub {
       my $rule = $_[0];
       return sub { split $rule, $_[0]; } if (ref $_[0] eq 'Regexp');
@@ -89,7 +104,8 @@ has _merge_obj => (
    default => sub { Hash::Merge->new($default_behavior); },
    handles => { qw(
       merge             merge
-      specify_behavior  merge_behavior
+      specify_behavior  specify_merge_behavior
+      set_behavior      set_merge_behavior
    ) },
 );
 
@@ -103,26 +119,30 @@ has error => (
 #############################################################################
 # Pre/post-BUILD
 
-around BUILDARGS => sub {
-   my ($orig, $self) = (shift, shift);
-   my $hash = shift;
-   $hash = { $hash, @_ } unless ref $hash;
-
-   ### INSERT CODE HERE ###
-   
-   $orig->($self, $hash);
-};
+#around BUILDARGS => sub {
+#   my ($orig, $self) = (shift, shift);
+#   my $hash = shift;
+#   $hash = { $hash, @_ } unless ref $hash;
+#
+#   ### INSERT CODE HERE ###
+#   
+#   $orig->($self, $hash);
+#};
 
 #############################################################################
 # Methods
+   use Devel::Dwarn;
 
 sub expand_hash {
    my ($self, $hash) = @_;
    $self->clear_error;
    
+   Dwarn $hash;
+   
    my $root;  # not sure if it's a hash or array yet
-   foreach my $path (sort keys $hash) {
+   foreach my $path (sort keys %$hash) {
       my $path_obj = $self->expand_path($path, $hash->{$path}) || return;  # error already set
+      Dwarn { $path => $path_obj };
       
       # New root?
       unless (defined $root) {
@@ -154,7 +174,7 @@ sub expand_path {
    my $leaf;
    for my $i (0 .. $#path_steps) {
       my $step = [ @path_steps[$i,$i+1] ];
-      pop @$step unless defined $step[1];
+      pop @$step unless defined $step->[1];
       
       # Step analysis
       for my $j (0 .. $#$step) {
@@ -170,10 +190,18 @@ sub expand_path {
       
       # Construct $root if we need to
       $root = $leaf = ( $step->[0]{type} eq 'HASH' ? {} : [] ) unless ($i);
-      
+
       # Add in the key, construct the next ref, and move the leaf forward
       my $type_str = join('|', map { $_->{type} } @$step);
       my $key = $step->[0]{val};
+
+      #Dwarn { before => {
+      #   'path'.$i => $step,
+      #   root => $root,
+      #   leaf => $leaf,
+      #   type => $type_str,
+      #   key  => $key,
+      #}};
       
       # (RIP for/when)
       if    ($type_str eq 'HASH|HASH')   { $leaf = $leaf->{$key} = {};   }
@@ -182,6 +210,12 @@ sub expand_path {
       elsif ($type_str eq 'ARRAY|ARRAY') { $leaf = $leaf->[$key] = [];   }
       elsif ($type_str eq 'HASH')        {         $leaf->{$key} = $val; }
       elsif ($type_str eq 'ARRAY')       {         $leaf->[$key] = $val; }
+
+      #Dwarn { after => {
+      #   root => $root,
+      #   leaf => $leaf,
+      #}};
+      
    }
 
    return $root;
@@ -192,12 +226,12 @@ sub step_type {
    
    my $val;
    my $type =
-      (defined $val = $self->hash_expand_rule ->($step)) ? 'HASH'  :
-      (defined $val = $self->array_expand_rule->($step)) ? 'ARRAY' : return;
+      defined($val = $self->hash_expand_rule ->($step)) ? 'HASH'  :
+      defined($val = $self->array_expand_rule->($step)) ? 'ARRAY' : return;
 
    return {
       type => $type,
-      val  => $1,
+      val  => $val,
    };
 }
 
