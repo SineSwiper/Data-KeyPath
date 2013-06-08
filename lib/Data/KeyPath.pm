@@ -13,6 +13,9 @@ use MooX::Types::MooseLike::Base qw(Str ArrayRef HashRef CodeRef RegexpRef Insta
 
 use Hash::Merge;
 use Try::Tiny;
+use Scalar::Util qw( blessed );
+
+use Data::KeyPath::Path;
 
 use namespace::clean;
 no warnings 'uninitialized';
@@ -28,17 +31,17 @@ Hash::Merge::specify_behavior(
       SCALAR => {
          SCALAR => sub { $_[1] },
          ARRAY  => sub {
-            return $_[1] unless $_[0];
+            return $_[1] unless length $_[0];
             die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'SCALAR', 'ARRAY', $_[0]);
          },
          HASH   => sub {
-            return $_[1] unless $_[0];
+            return $_[1] unless length $_[0];
             die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'SCALAR', 'HASH',  $_[0]);
          },
       },
       ARRAY => {
          SCALAR => sub {
-            return $_[0] unless $_[1];
+            return $_[0] unless length $_[1];
             die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'ARRAY', 'SCALAR', $_[1]);
          },
          ARRAY  => sub {
@@ -54,49 +57,77 @@ Hash::Merge::specify_behavior(
       },
       HASH => {
          SCALAR => sub {
-            return $_[0] unless $_[1];
+            return $_[0] unless length $_[1];
             die sprintf('mismatched type (%s vs. %s) found during merge: $scalar = %s', 'HASH', 'SCALAR', $_[1]);
          },
          ARRAY  => sub { die sprintf('mismatched type (%s vs. %s) found during merge', 'HASH', 'ARRAY'); },
-         HASH   => sub { Hash::Merge::_merge_hashes( $_[0], $_[1] ) }, 
+         HASH   => sub { Hash::Merge::_merge_hashes( $_[0], $_[1] ) },
       },
-   }, 
+   },
    $default_behavior,
 );
 
 #############################################################################
 # Attributes
 
-my $rule_coercion = sub {
-   my $rule = $_[0];
-   return sub { ($_[0] =~ $rule) ? $1 : undef; } if (ref $_[0] eq 'Regexp');
-   $rule;
-};
+#### TERMINOLOGY ####
 
-has key_split_expand_rule => (
+# Path = A full string path to a destination within a tree
+# Step = A path fragment, which indicates both the key and type
+# Key  = Either a hash key or an array index
+# Type = A ref type: either HASH or ARRAY (for now)
+
+### TODO: Quote handling needs its own attr sub or switch ###
+
+### FIXME: Make most of these required with no default ###
+
+has hash_step_regexp => (
    is      => 'ro',
-   isa     => AnyOf[RegexpRef, CodeRef],
-   default => sub { qr/\.|(?<=\]|\w)\.?(?=\[)/ },
-   coerce  => sub {
-      my $rule = $_[0];
-      return sub { split $rule, $_[0]; } if (ref $_[0] eq 'Regexp');
-      $rule;
-   },
+   isa     => RegexpRef,
+   default => sub { qr/
+      (?<key>\w+|(?=\.))|
+      (?<quote>['"])(?<key> (?:
+         # The (?!) is a fancy way of saying ([^\"\\]*) with a variable quote character
+         (?>(?: (?! \\|\g{quote}). )*) |  # Most stuff (no backtracking)
+         \\ \g{quote}                  |  # Escaped quotes
+         \\ (?! \g{quote})                # Any other escaped character
+      )* )\g{quote}|
+      (?<key>^$)
+   /x },
 );
 
-has hash_expand_rule => (
+has array_step_regexp => (
    is      => 'ro',
-   isa     => AnyOf[RegexpRef, CodeRef],
-   default => sub { qr/^(\w*)$/ },
-   coerce  => $rule_coercion,
+   isa     => RegexpRef,
+   default => sub { qr/\[(?<key>\d{1,5})\]/ },
 );
 
-has array_expand_rule => (
+has delimiter => (
    is      => 'ro',
-   isa     => AnyOf[RegexpRef, CodeRef],
-   default => sub { qr/^\[(\d+)\]$/ },
-   coerce  => $rule_coercion,
+   isa     => Str,
+   default => sub { '.' },
 );
+
+has delimiter_regexp => (
+   is      => 'ro',
+   isa     => RegexpRef,
+   default => sub { qr/(?:\.|(?=\[))/ },
+);
+
+has delimiter_placement => (
+   is      => 'ro',
+   isa     => Str,
+   default => sub { 'HH|AH' },
+);
+
+#my $rule_coercion = sub {
+#   my $rule = $_[0];
+#   return sub {
+#      my ($path, $key, $depth) = @_;
+#      sprintf $rule, $_[0];
+#   } unless (ref $rule);
+#   $rule;
+#};
 
 has _merge_obj => (
    is      => 'rw',
@@ -111,128 +142,140 @@ has _merge_obj => (
 
 has error => (
    is      => 'rwp',
-   isa     => Maybe[Str],
+   isa     => Str,
    predicate => 1,
    clearer   => 1,
 );
 
 #############################################################################
-# Pre/post-BUILD
-
-#around BUILDARGS => sub {
-#   my ($orig, $self) = (shift, shift);
-#   my $hash = shift;
-#   $hash = { $hash, @_ } unless ref $hash;
-#
-#   ### INSERT CODE HERE ###
-#   
-#   $orig->($self, $hash);
-#};
-
-#############################################################################
 # Methods
-   use Devel::Dwarn;
+
+### EXPANSION ###
 
 sub expand_hash {
    my ($self, $hash) = @_;
    $self->clear_error;
-   
-   Dwarn $hash;
-   
+
    my $root;  # not sure if it's a hash or array yet
    foreach my $path (sort keys %$hash) {
-      my $path_obj = $self->expand_path($path, $hash->{$path}) || return;  # error already set
-      Dwarn { $path => $path_obj };
-      
+      my $branch = $self->expand_pathval($path, $hash->{$path}) || return;  # error already set
+
       # New root?
       unless (defined $root) {
-         $root = $path_obj;
+         $root = $branch;
          next;
       }
-      
+
       # Our merge behavior might die on us (or Hash::Merge itself)
       my $err;
-      try   { $root = $self->merge($root, $path_obj); }
+      try   { $root = $self->merge($root, $branch); }
       catch { $err = $_; };
 
       if ($err) {
+         # Add path to error
          $self->_set_error( sprintf "In path '%s', %s", $path, $err );
          return;
       }
    }
-   
+
    return $root;
 }
 
-sub expand_path {
+sub expand_pathval {
    my ($self, $path, $val) = @_;
    $self->clear_error;
 
-   my $root;
-   my @path_steps = $self->key_split_expand_rule->($path);
-   
-   my $leaf;
-   for my $i (0 .. $#path_steps) {
-      my $step = [ @path_steps[$i,$i+1] ];
-      pop @$step unless defined $step->[1];
-      
-      # Step analysis
-      for my $j (0 .. $#$step) {
-         my $str = $step->[$j];
+   my ($root, $leaf, $hash_steps);
+   $path = Data::KeyPath::Path->new(
+      keypath_obj => $self,
+      path => $path,
+   ) // return;
 
-         # NOTE: re-defining $step->[$j]
-         $step->[$j] = $self->step_type($str) || do {
-            $self->_set_error( sprintf "In path '%s', found unparsable step: '%s' (depth %u)", $path, $str, $i+$j );
-            return;
-         };
-         $step->[$j]{str} = $str;
-      }
-      
+   for my $i (0 .. $path->depth - 1) {
+      my $hash_step = $path->_path->[$i];
+      my $next_step = ($i == $path->depth - 1) ? undef : $path->_path->[$i+1];
+
       # Construct $root if we need to
-      $root = $leaf = ( $step->[0]{type} eq 'HASH' ? {} : [] ) unless ($i);
+      $root = $leaf = ( $hash_step->{type} eq 'HASH' ? {} : [] ) unless ($i);
 
       # Add in the key, construct the next ref, and move the leaf forward
-      my $type_str = join('|', map { $_->{type} } @$step);
-      my $key = $step->[0]{val};
+      my $type_str = substr($hash_step->{type}, 0, 1);
+      $type_str   .= substr($next_step->{type}, 0, 1) if $next_step;
 
-      #Dwarn { before => {
-      #   'path'.$i => $step,
-      #   root => $root,
-      #   leaf => $leaf,
-      #   type => $type_str,
-      #   key  => $key,
-      #}};
-      
+      my $key = $hash_step->{key};
+
       # (RIP for/when)
-      if    ($type_str eq 'HASH|HASH')   { $leaf = $leaf->{$key} = {};   }
-      elsif ($type_str eq 'HASH|ARRAY')  { $leaf = $leaf->{$key} = [];   }
-      elsif ($type_str eq 'ARRAY|HASH')  { $leaf = $leaf->[$key] = {};   }
-      elsif ($type_str eq 'ARRAY|ARRAY') { $leaf = $leaf->[$key] = [];   }
-      elsif ($type_str eq 'HASH')        {         $leaf->{$key} = $val; }
-      elsif ($type_str eq 'ARRAY')       {         $leaf->[$key] = $val; }
-
-      #Dwarn { after => {
-      #   root => $root,
-      #   leaf => $leaf,
-      #}};
-      
+      if    ($type_str eq 'HH') { $leaf = $leaf->{$key} = {};   }
+      elsif ($type_str eq 'HA') { $leaf = $leaf->{$key} = [];   }
+      elsif ($type_str eq 'AH') { $leaf = $leaf->[$key] = {};   }
+      elsif ($type_str eq 'AA') { $leaf = $leaf->[$key] = [];   }
+      elsif ($type_str eq 'H')  {         $leaf->{$key} = $val; }
+      elsif ($type_str eq 'A')  {         $leaf->[$key] = $val; }
    }
 
    return $root;
 }
 
-sub step_type {
-   my ($self, $step) = @_;
-   
-   my $val;
-   my $type =
-      defined($val = $self->hash_expand_rule ->($step)) ? 'HASH'  :
-      defined($val = $self->array_expand_rule->($step)) ? 'ARRAY' : return;
+### FLATTENING ###
 
-   return {
-      type => $type,
-      val  => $val,
-   };
+sub flatten_ref {
+   my ($self, $ref) = @_;
+   $self->clear_error;
+
+   my $type = ref $ref;
+   unless (defined $ref && !blessed $ref && $type =~ /HASH|ARRAY/) {
+      $self->_set_error('Reference must be an unblessed HASH or ARRAY!');
+      return;
+   }
+
+   return $self->flatten_refpath('', $ref, 0);
+}
+
+sub flatten_refpath {
+   my ($self, $path, $ref) = @_;
+   $path //= '';
+   $self->clear_error;
+
+   my $prh = { $path => $ref };  # single row answer
+
+   return $prh if blessed $ref;  # down that path leads madness...
+   my $type = ref $ref || return $prh;        # that covers SCALARs...
+   return $prh unless $type =~ /HASH|ARRAY/;  # ...and all other endpoints
+
+   # Bless the path
+   unless (blessed $path) {
+      $path = Data::KeyPath::Path->new(
+         keypath_obj => $self,
+         path => $path,
+      ) // return;
+   }
+
+   if ($path->depth > 255) {  # XXX: Might already be checked with Path object
+      $self->_set_error( sprintf "Too deep down the rabbit hole, stopped at '%s'", $path );
+      return;
+   }
+
+   my $hash = {};
+   my @keys = $type eq 'HASH' ? (keys %$ref) : (0 .. $#$ref);
+   foreach my $key (@keys) {
+      my $val = $type eq 'HASH' ? $ref->{$key} : $ref->[$key];
+
+      # Add on to $path
+      my $newpath = $path->clone;
+      $newpath->push({
+         type => $type,
+         key  => $key,
+      }) || return;  # error already defined
+
+      # Recurse back to give us a full set of $path => $val pairs
+      my $newhash = $self->flatten_refpath($newpath, $val) || return;  # error already defined
+
+      # Merge (shallowly)
+      ### FIXME: We are removing undef here, but we might want a switch for that ###
+      $hash->{$_} = $newhash->{$_} for (grep { defined $newhash->{$_} } keys %$newhash);
+   }
+
+   return $hash;
 }
 
 42;
@@ -242,9 +285,9 @@ __END__
 =begin wikidoc
 
 = SYNOPSIS
- 
+
    # code
- 
+
 = DESCRIPTION
 
 ### Ruler ##################################################################################################################################12345
