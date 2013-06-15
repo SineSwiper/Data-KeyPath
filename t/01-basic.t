@@ -1,8 +1,8 @@
-use Data::KeyPath;
+use Data::Stash;
 use Test::More tests => 25;
 
 my ($hash, $tree);
-my $dkp = new_ok('Data::KeyPath');
+my $dso = new_ok('Data::Stash');
 
 test_both_ways(
    {
@@ -93,17 +93,17 @@ sub test_both_ways {
    my ($hash_start, $expect_tree, $expect_hash, $name) = @_;
 
    # expand_hash
-   my $tree = $dkp->expand_hash($hash_start);
-   ok(!$dkp->has_error, 'No error') || diag $dkp->error;
+   my $tree = $dso->expand_hash($hash_start);
+   ok(!$dso->has_error, 'No error') || diag $dso->error;
    is_deeply($tree, $expect_tree, $name.' expanded correctly') || diag explain $tree;
 
    # flatten_ref
-   my $hash = $dkp->flatten_ref($tree);
-   ok(!$dkp->has_error, 'No error') || diag $dkp->error;
+   my $hash = $dso->flatten_ref($tree);
+   ok(!$dso->has_error, 'No error') || diag $dso->error;
    is_deeply($hash, $expect_hash, $name.' flattened correctly') || diag explain $hash;
 
    # expand_hash
-   $tree = $dkp->expand_hash($hash);
-   ok(!$dkp->has_error, 'No error') || diag $dkp->error;
+   $tree = $dso->expand_hash($hash);
+   ok(!$dso->has_error, 'No error') || diag $dkp->error;
    is_deeply($tree, $expect_tree, $name.' re-expanded correctly') || diag explain $tree;
 }

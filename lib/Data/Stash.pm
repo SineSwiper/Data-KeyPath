@@ -1,4 +1,4 @@
-package Data::KeyPath;
+package Data::Stash;
 
 # VERSION
 # ABSTRACT: Expand/flatten/search paths
@@ -8,14 +8,13 @@ package Data::KeyPath;
 
 use sanity;
 use Moo;
-use MooX::Types::MooseLike 0.18;  # AnyOf support
-use MooX::Types::MooseLike::Base qw(Str ArrayRef HashRef CodeRef RegexpRef InstanceOf AnyOf Maybe);
+use MooX::Types::MooseLike 0.18;  # *Of support
+use MooX::Types::MooseLike::Base qw(Str HashRef InstanceOf HasMethods);
 
+use Class::Load 0.17 ('load_class');  # 0.17 = wheezy's version
 use Hash::Merge;
 use Try::Tiny;
 use Scalar::Util qw( blessed );
-
-use Data::KeyPath::Path;
 
 use namespace::clean;
 no warnings 'uninitialized';
@@ -77,58 +76,6 @@ Hash::Merge::specify_behavior(
 # Key  = Either a hash key or an array index
 # Type = A ref type: either HASH or ARRAY (for now)
 
-### TODO: Quote handling needs its own attr sub or switch ###
-
-### FIXME: Make most of these required with no default ###
-
-has hash_step_regexp => (
-   is      => 'ro',
-   isa     => RegexpRef,
-   default => sub { qr/
-      (?<key>\w+|(?=\.))|
-      (?<quote>['"])(?<key> (?:
-         # The (?!) is a fancy way of saying ([^\"\\]*) with a variable quote character
-         (?>(?: (?! \\|\g{quote}). )*) |  # Most stuff (no backtracking)
-         \\ \g{quote}                  |  # Escaped quotes
-         \\ (?! \g{quote})                # Any other escaped character
-      )* )\g{quote}|
-      (?<key>^$)
-   /x },
-);
-
-has array_step_regexp => (
-   is      => 'ro',
-   isa     => RegexpRef,
-   default => sub { qr/\[(?<key>\d{1,5})\]/ },
-);
-
-has delimiter => (
-   is      => 'ro',
-   isa     => Str,
-   default => sub { '.' },
-);
-
-has delimiter_regexp => (
-   is      => 'ro',
-   isa     => RegexpRef,
-   default => sub { qr/(?:\.|(?=\[))/ },
-);
-
-has delimiter_placement => (
-   is      => 'ro',
-   isa     => Str,
-   default => sub { 'HH|AH' },
-);
-
-#my $rule_coercion = sub {
-#   my $rule = $_[0];
-#   return sub {
-#      my ($path, $key, $depth) = @_;
-#      sprintf $rule, $_[0];
-#   } unless (ref $rule);
-#   $rule;
-#};
-
 has _merge_obj => (
    is      => 'rw',
    isa     => InstanceOf['Hash::Merge'],
@@ -140,6 +87,34 @@ has _merge_obj => (
    ) },
 );
 
+has cache_obj => (
+   is      => 'ro',
+   isa     => HasMethods[qw(get set remove clear dump_as_hash)],
+   default => sub {
+      use Data::Stash::HashCache;
+      Data::Stash::HashCache->new;
+   },
+   handles => [qw(get remove clear dump_as_hash)],
+);
+
+has path_class => (
+   is      => 'ro',
+   isa     => Str,
+   default => sub { 'DZIL' },
+   coerce  => sub {
+      'Data::Path::'.$_[0] unless ($_[0] =~ s/^\=//);  # NOTE: kill two birds with one stone
+   },
+);
+
+has path_options => (
+   is      => 'ro',
+   isa     => HashRef,
+   default => sub { {
+      auto_normalize => 1,
+      auto_cleanup   => 1,
+   } },
+);
+
 has error => (
    is      => 'rwp',
    isa     => Str,
@@ -148,7 +123,65 @@ has error => (
 );
 
 #############################################################################
+# Pre/post-BUILD
+
+sub BUILD {
+   my $self = $_[0];
+
+   # Load the path class
+   load_class $self->path_class;
+
+   return $self;
+}
+
+#############################################################################
 # Methods
+
+### CACHING ###
+
+sub set {
+   my ($self, $thing) = (shift, shift);
+
+   # Key/data pair
+   unless (ref $thing) {
+      return $self->cache_obj->set($thing, @_);
+   }
+
+   # Flatten hash (hopefully)
+   elsif (ref $thing eq 'HASH') {
+      $self->cache_obj->set($_, $thing->{$_}, @_) for (keys %$thing);
+      return 1;
+   }
+
+   # Blessed?!  Maybe somebody forgot to stringify it?
+   elsif (blessed $thing and $_[0]) {
+      return $self->cache_obj->set("$thing", @_);
+   }
+
+   # WTF is this?
+   else {
+      $self->_set_error( sprintf "Set can't process a %s", ref $thing );
+      return;
+   }
+}
+
+sub flatten_and_set {
+   my ($self, $ref) = (shift, shift);
+   my $hash = $self->flatten_ref($ref) || return;  # error already set
+   return $self->set($hash, @_);
+}
+
+sub get_and_expand {
+   my ($self, $key) = (shift, shift);
+   my $data = $self->get($key, @_);
+   return $self->expand_pathval($key, $data);
+}
+
+sub get_all_and_expand {
+   my ($self) = (shift);
+   my $hash = $self->dump_as_hash(@_);
+   return $self->expand_hash($hash);
+}
 
 ### EXPANSION ###
 
@@ -186,14 +219,15 @@ sub expand_pathval {
    $self->clear_error;
 
    my ($root, $leaf, $hash_steps);
-   $path = Data::KeyPath::Path->new(
-      keypath_obj => $self,
+   $path = $self->path_class->new(
+      %{ $self->path_options },
+      stash_obj => $self,
       path => $path,
    ) // return;
 
-   for my $i (0 .. $path->depth - 1) {
+   for my $i (0 .. $path->step_count - 1) {
       my $hash_step = $path->_path->[$i];
-      my $next_step = ($i == $path->depth - 1) ? undef : $path->_path->[$i+1];
+      my $next_step = ($i == $path->step_count - 1) ? undef : $path->_path->[$i+1];
 
       # Construct $root if we need to
       $root = $leaf = ( $hash_step->{type} eq 'HASH' ? {} : [] ) unless ($i);
@@ -242,15 +276,16 @@ sub flatten_refpath {
    my $type = ref $ref || return $prh;        # that covers SCALARs...
    return $prh unless $type =~ /HASH|ARRAY/;  # ...and all other endpoints
 
-   # Bless the path
+   # Blessed is the path
    unless (blessed $path) {
-      $path = Data::KeyPath::Path->new(
-         keypath_obj => $self,
+      $path = $self->path_class->new(
+         %{ $self->path_options },
+         stash_obj => $self,
          path => $path,
       ) // return;
    }
 
-   if ($path->depth > 255) {  # XXX: Might already be checked with Path object
+   if ($path->step_count > 255) {  # XXX: Might already be checked with Path object
       $self->_set_error( sprintf "Too deep down the rabbit hole, stopped at '%s'", $path );
       return;
    }
@@ -263,15 +298,16 @@ sub flatten_refpath {
       # Add on to $path
       my $newpath = $path->clone;
       $newpath->push({
-         type => $type,
-         key  => $key,
+         type  => $type,
+         key   => $key,
+         depth => $path->step_count ? 'X+1' : 0,
       }) || return;  # error already defined
 
       # Recurse back to give us a full set of $path => $val pairs
       my $newhash = $self->flatten_refpath($newpath, $val) || return;  # error already defined
 
       # Merge (shallowly)
-      ### FIXME: We are removing undef here, but we might want a switch for that ###
+      ### XXX: We are removing undef here, but we might want a switch for that ###
       $hash->{$_} = $newhash->{$_} for (grep { defined $newhash->{$_} } keys %$newhash);
    }
 
