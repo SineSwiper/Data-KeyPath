@@ -289,6 +289,9 @@ sub cleanup {
                next;
             }
 
+            # Just ignore zero-depth (ie: /./)
+            next unless $depth;
+
             # Carve off a slice of the $new_path
             my @back_path = splice(@$new_path, $depth);
 
@@ -539,8 +542,6 @@ sub as_string {
       my $hash_step = $self->_path->[$i];
       my $next_step = ($i == $self->step_count - 1) ? undef : $self->_path->[$i+1];
 
-      ### FIXME: Revisit this after plotting all of the path classes...
-      ### We may not need relative-depth-specific placement rules.
       my $d = $hash_step->{depth};
 
       ### Left side delimiter placement

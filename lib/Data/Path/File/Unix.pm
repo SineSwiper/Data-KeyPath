@@ -1,63 +1,55 @@
-package Data::Stash::HashCache;
+package Data::Path::File::Unix;
 
 # VERSION
-# ABSTRACT: Very simple default hash cache for Data::Stash
+# ABSTRACT: UNIX file path support
 
 #############################################################################
 # Modules
 
 use sanity;
 use Moo;
-use MooX::Types::MooseLike 0.18;  # *Of support
-use MooX::Types::MooseLike::Base qw(Str HashRef InstanceOf HasMethods);
-
-use Storable qw( dclone );
 
 use namespace::clean;
 no warnings 'uninitialized';
 
 #############################################################################
-# Attributes
+# Required Methods
 
-has _cache => (
-   is       => 'rw',
-   isa      => HashRef,
-   default  => sub { { } },
-   init_arg => undef,
-);
+with 'Data::Path::Role::Path';
 
-#############################################################################
-# Methods
+sub blueprint { {
+   hash_step_regexp => qr{
+      # Illegal characters are a mere \0 and /
+      (?<key>[^/\0]*)
+   }x,
 
-sub set {
-   my ($self, $key, $data) = @_;
-   $self->_cache->{$key} = $data;
-}
+   array_step_regexp   => qr/\Z.\A/,  # no-op; arrays not supported
+   delimiter_regexp    => qr{/+},     # + to capture repetitive slashes, like foo////bar
 
-sub get {
-   my ($self, $key) = @_;
-   $self->_cache->{$key};
-}
+   # no support for escapes
+   unescape_sub          => undef,
+   unescape_quote_regexp => qr/\Z.\A/,
 
-sub remove {
-   my ($self, $key) = @_;
-   delete $self->_cache->{$key};
-}
+   delimiter_placement => {
+      '0R' => '/',
+      HH   => '/',
+   },
 
-sub clear {
-   my ($self) = @_;
-   $self->_cache({});
-}
+   depth_translation => {
+      qr{^/+$}     => 0,
+      qr{^\.\./*$} => 'X-1',
+      qr{^\./*$}   => 'X-0',
+      '#DEFAULT#'  => 'X+1',
+   },
 
-sub dump_as_hash {
-   my ($self) = @_;
-   dclone($self->_cache);
-}
+   array_step_sprintf       => '',
+   hash_step_sprintf        => '%s',
+   hash_step_sprintf_quoted => '%s',
+   quote_on_regexp          => qr/\Z.\A/,  # no-op; quoting not supported
 
-sub get_keys {
-   my ($self) = @_;
-   keys %{$self->_cache};
-}
+   escape_sub       => undef,
+   escape_on_regexp => qr/\Z.\A/,
+} }
 
 42;
 

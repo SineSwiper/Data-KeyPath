@@ -1,10 +1,13 @@
 use Data::Stash;
 use Test::More tests => 25;
 
+use lib 't/lib';
+use StashTest;
+
 my ($hash, $tree);
 my $dso = new_ok('Data::Stash');
 
-test_both_ways(
+test_both_ways($dso,
    {
       'a[4]' => 2,
       'a[1].b.c.d' => 3,
@@ -33,7 +36,7 @@ test_both_ways(
    'Basic hash',
 );
 
-test_both_ways(
+test_both_ways($dso,
    {
       '[4]' => 2,
       '[1].b.c.d' => 3,
@@ -60,7 +63,7 @@ test_both_ways(
    'Array-is-first',
 );
 
-test_both_ways(
+test_both_ways($dso,
    {
       q{"This can't be a terrible mistake"[0].value} => 2,
       q{'"Oh, but it can..." said the spider'.[0].value} => 3,
@@ -76,7 +79,7 @@ test_both_ways(
    'Quoted hash',
 );
 
-test_both_ways(
+test_both_ways($dso,
    {
       'a.b...c[0].""."".' . "''" => 2,
    },
@@ -88,22 +91,3 @@ test_both_ways(
    },
    'Zero-length keys',
 );
-
-sub test_both_ways {
-   my ($hash_start, $expect_tree, $expect_hash, $name) = @_;
-
-   # expand_hash
-   my $tree = $dso->expand_hash($hash_start);
-   ok(!$dso->has_error, 'No error') || diag $dso->error;
-   is_deeply($tree, $expect_tree, $name.' expanded correctly') || diag explain $tree;
-
-   # flatten_ref
-   my $hash = $dso->flatten_ref($tree);
-   ok(!$dso->has_error, 'No error') || diag $dso->error;
-   is_deeply($hash, $expect_hash, $name.' flattened correctly') || diag explain $hash;
-
-   # expand_hash
-   $tree = $dso->expand_hash($hash);
-   ok(!$dso->has_error, 'No error') || diag $dkp->error;
-   is_deeply($tree, $expect_tree, $name.' re-expanded correctly') || diag explain $tree;
-}
